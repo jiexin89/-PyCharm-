@@ -1,20 +1,17 @@
+import ctypes
 import win32gui
 import win32api
 import win32con
-import ctypes
-from ctypes import wintypes
+import pywintypes
+import logging
 from pynput import mouse, keyboard
 from concurrent.futures import ThreadPoolExecutor
-import pywintypes
 import time
-import win32clipboard
 
+# 日志设置
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # 定义 ctypes 结构体用于发送鼠标事件
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-
 class INPUT(ctypes.Structure):
     class _INPUT(ctypes.Union):
         class _MOUSEINPUT(ctypes.Structure):
@@ -29,151 +26,152 @@ class INPUT(ctypes.Structure):
 
     _fields_ = [("type", ctypes.c_ulong), ("input_union", _INPUT)]
 
-
-# 设置窗口大小为 639x504
-def set_window_size(hwnd):
-    width, height = 639, 504
-    if win32gui.IsWindow(hwnd):
-        try:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, width, height, win32con.SWP_NOMOVE)
-        except pywintypes.error as e:
-            print(f"Error in SetWindowPos for hwnd {hwnd}: {e}")
-    else:
-        print(f"Invalid window handle: {hwnd}")
-
+# 全局变量控制同步功能
+sync_enabled = True
 
 # 获取所有 Chrome 窗口句柄
 def enumerate_chrome_windows():
     windows = []
 
-    def window_callback(hwnd, windows):
-        if 'Chrome' in win32gui.GetWindowText(hwnd):
-            set_window_size(hwnd)
+    def window_callback(hwnd, _):
+        class_name = win32gui.GetClassName(hwnd)
+        window_title = win32gui.GetWindowText(hwnd)
+
+        if class_name == 'Chrome_WidgetWin_1' and 'Google Chrome' in window_title:
             windows.append(hwnd)
 
-    win32gui.EnumWindows(window_callback, windows)
+    win32gui.EnumWindows(window_callback, None)
+    logging.info(f"Found Chrome windows: {windows}")
     return windows
 
+# 设置窗口大小为 639x520
+def set_window_size(hwnd, width=639, height=520):
+    if win32gui.IsWindow(hwnd):
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, width, height, win32con.SWP_NOMOVE)
+            logging.info(f"Set window size for hwnd {hwnd} to {width}x{height}")
+        except pywintypes.error as e:
+            logging.error(f"Error in SetWindowPos for hwnd {hwnd}: {e}")
 
-# 提取公共代码以减少重复
-def send_click_message(hwnd, message, x, y):
-    lparam = win32api.MAKELONG(x, y)
+# 激活窗口，减少延迟
+def activate_window(hwnd):
     try:
-        win32gui.SendMessage(hwnd, message, 0, lparam)
-    except pywtypes.error as e:
-        print(f"Error sending message to hwnd {hwnd}: {e}")
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.01)  # 将延迟缩短到 0.01 秒
+        logging.info(f"Activated hwnd {hwnd}")
+    except Exception as e:
+        logging.error(f"Error activating hwnd {hwnd}: {e}")
 
+# 同步鼠标点击到多个窗口
+def sync_mouse_click(x, y, button='left', hwnds=None, skip_activate_main_hwnd=None):
+    if not sync_enabled or not hwnds:
+        return
 
-def send_mouse_click(hwnd, x, y, button='left', double_click=False):
+    button_down_msg = win32con.WM_LBUTTONDOWN if button == 'left' else win32con.WM_RBUTTONDOWN
+    button_up_msg = win32con.WM_LBUTTONUP if button == 'left' else win32con.WM_RBUTTONUP
+
+    with ThreadPoolExecutor(max_workers=len(hwnds)) as executor:  # 增加并发线程数量
+        for hwnd in hwnds:
+            if hwnd == skip_activate_main_hwnd:
+                continue
+            executor.submit(send_mouse_event, hwnd, x, y, button_down_msg, button_up_msg)
+
+def send_mouse_event(hwnd, x, y, button_down, button_up):
     try:
-        # 获取窗口客户区坐标
-        rect = win32gui.GetClientRect(hwnd)
-        client_x = x + rect[0]  # 相对于客户区的 x
-        client_y = y + rect[1]  # 相对于客户区的 y
+        activate_window(hwnd)
 
-        if button == 'left':
-            send_click_message(hwnd, win32con.WM_LBUTTONDOWN, client_x, client_y)
-            time.sleep(0.001)  # 减少响应时间
-            send_click_message(hwnd, win32con.WM_LBUTTONUP, client_x, client_y)
-            if double_click:
-                time.sleep(0.001)
-                send_click_message(hwnd, win32con.WM_LBUTTONDBLCLK, client_x, client_y)
-                send_click_message(hwnd, win32con.WM_LBUTTONUP, client_x, client_y)
-        elif button == 'right':
-            send_click_message(hwnd, win32con.WM_RBUTTONDOWN, client_x, client_y)
-            time.sleep(0.001)  # 减少响应时间
-            send_click_message(hwnd, win32con.WM_RBUTTONUP, client_x, client_y)
-            if double_click:
-                time.sleep(0.001)
-                send_click_message(hwnd, win32con.WM_RBUTTONDBLCLK, client_x, client_y)
-                send_click_message(hwnd, win32con.WM_RBUTTONUP, client_x, client_y)
-    except pywintypes.error as e:
-        print(f"Error sending mouse click to hwnd {hwnd}: {e}")
+        lparam = win32api.MAKELONG(int(x), int(y))
 
-
-# 发送键盘按键消息，支持组合键
-def send_key_press(hwnd, keys):
-    try:
-        if isinstance(keys, list):
-            for key in keys:
-                win32gui.SendMessageTimeout(hwnd, win32con.WM_KEYDOWN, key, 0, win32con.SMTO_ABORTIFHUNG, 100)
-            for key in reversed(keys):
-                win32gui.SendMessageTimeout(hwnd, win32con.WM_KEYUP, key, 0, win32con.SMTO_ABORTIFHUNG, 100)
-        else:
-            win32gui.SendMessageTimeout(hwnd, win32con.WM_KEYDOWN, keys, 0, win32con.SMTO_ABORTIFHUNG, 100)
-            win32gui.SendMessageTimeout(hwnd, win32con.WM_KEYUP, keys, 0, win32con.SMTO_ABORTIFHUNG, 100)
-    except pywintypes.error as e:
-        print(f"Error sending key press to hwnd {hwnd}: {e}")
-
-
-# 发送中文字符通过剪贴板
-def send_chinese_chars_via_clipboard(hwnds, chinese_chars):
-    win32clipboard.OpenClipboard()
-    win32clipboard.EmptyClipboard()
-    win32clipboard.SetClipboardText(chinese_chars)
-    win32clipboard.CloseClipboard()
-
-    for hwnd in hwnds:
-        send_key_press(hwnd, [win32con.VK_CONTROL, ord('V')])  # 发送 Ctrl + V
-
+        win32gui.PostMessage(hwnd, button_down, 0, lparam)
+        win32gui.PostMessage(hwnd, button_up, 0, lparam)
+        logging.info(f"Mouse click sent to hwnd {hwnd} at ({x}, {y})")
+    except Exception as e:
+        logging.error(f"Error sending mouse click to hwnd {hwnd}: {e}")
 
 # 键盘按键映射函数
 def map_key_to_vk(key):
     try:
-        if hasattr(key, 'char') and key.char is not None:
-            char = key.char
-            if 'a' <= char <= 'z':  # 小写字母
-                return ord(char.upper())  # 返回大写字母的虚拟键码
-            elif 'A' <= char <= 'Z':  # 大写字母
-                return ord(char)
-            elif '0' <= char <= '9':  # 数字
-                return ord(char)
-        else:
-            return {
-                keyboard.Key.enter: win32con.VK_RETURN,
-                keyboard.Key.space: win32con.VK_SPACE,
-                keyboard.Key.backspace: win32con.VK_BACK,
-                keyboard.Key.shift: win32con.VK_SHIFT,
-                keyboard.Key.ctrl_l: win32con.VK_CONTROL,
-                keyboard.Key.alt_l: win32con.VK_MENU,
-                keyboard.Key.tab: win32con.VK_TAB,
-                keyboard.Key.esc: win32con.VK_ESCAPE,
-            }.get(key, 0)
-    except Exception as e:
-        print(f"Error mapping key {key}: {e}")
-        return 0
+        if isinstance(key, keyboard.Key):
+            if key == keyboard.Key.space:
+                return win32con.VK_SPACE
+            elif key == keyboard.Key.enter:
+                return win32con.VK_RETURN
+            elif key == keyboard.Key.backspace:
+                return win32con.VK_BACK
+            elif key == keyboard.Key.tab:
+                return win32con.VK_TAB
+        return key.vk if isinstance(key, keyboard.KeyCode) else None
+    except AttributeError:
+        return None
 
+# 同步键盘按键到多个窗口
+def sync_key_press(keys, hwnds=None, skip_activate_main_hwnd=None):
+    if not sync_enabled or not hwnds:
+        return
 
-# 键盘按键事件监听器优化
-def on_press(key):
+    with ThreadPoolExecutor(max_workers=len(hwnds)) as executor:  # 增加并发线程数量
+        for hwnd in hwnds:
+            if hwnd == skip_activate_main_hwnd:
+                continue
+            executor.submit(send_key_event, hwnd, keys)
+
+def send_key_event(hwnd, keys):
     try:
-        if hasattr(key, 'char') and key.char:  # 处理可打印字符
-            if key.char.isascii():  # 只处理ASCII字符
-                vk_code = map_key_to_vk(key)
-                if vk_code:
-                    print(f"Key {key} pressed, vk_code: {vk_code}")
-                    sync_perform_action('keypress', keys=vk_code)
-            else:
-                # 处理中文输入
-                chinese_input = key.char  # 假设输入了中文字符
-                hwnds = enumerate_chrome_windows()
-                if hwnds:
-                    send_chinese_chars_via_clipboard(hwnds, chinese_input)  # 发送中文字符到所有窗口
-                else:
-                    print("No Chrome windows found for Chinese input.")
+        activate_window(hwnd)
+
+        win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, keys, 0)
+        logging.info(f"Key press '{keys}' sent to hwnd {hwnd}")
     except Exception as e:
-        print(f"Error processing key press: {e}")
+        logging.error(f"Error sending key press to hwnd {hwnd}: {e}")
 
-
-# 鼠标点击事件监听器
+# 鼠标点击事件处理函数
 def on_click(x, y, button, pressed):
     if pressed:
-        print(f"Mouse clicked at ({x}, {y}) with {button}")
-        sync_perform_action('click', x, y, button=button.name)
+        hwnds = enumerate_chrome_windows()
+        main_hwnd = win32gui.GetForegroundWindow()
+        sync_mouse_click(x, y, button=button.name, hwnds=hwnds, skip_activate_main_hwnd=main_hwnd)
 
+# 键盘按键事件处理函数
+def on_press(key):
+    global sync_enabled
 
-# 启动监听器
+    if key == keyboard.Key.f8:  # 切换群控同步
+        sync_enabled = not sync_enabled
+        logging.info(f"Sync {'enabled' if sync_enabled else 'disabled'}")
+    elif key == keyboard.Key.f9:  # 重新排列窗口
+        hwnds = enumerate_chrome_windows()
+        rearrange_windows(hwnds)
+    else:
+        vk_code = map_key_to_vk(key)
+        if vk_code:
+            hwnds = enumerate_chrome_windows()
+            main_hwnd = win32gui.GetForegroundWindow()
+            sync_key_press(vk_code, hwnds=hwnds, skip_activate_main_hwnd=main_hwnd)
+
+# 重新排列窗口
+def rearrange_windows(hwnds, width=639, height=504):
+    screen_width = win32api.GetSystemMetrics(0)
+    screen_height = win32api.GetSystemMetrics(1)
+
+    cols = screen_width // width
+    rows = screen_height // height
+
+    for i, hwnd in enumerate(hwnds):
+        row = i // cols
+        col = i % cols
+        x = col * width
+        y = row * height
+
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, y, width, height, 0)
+            logging.info(f"Rearranged hwnd {hwnd} to ({x}, {y}, {width}, {height})")
+        except pywintypes.error as e:
+            logging.error(f"Error rearranging hwnd {hwnd}: {e}")
+
+# 启动鼠标和键盘监听器
 def start_listener():
     with ThreadPoolExecutor() as executor:
         mouse_listener = mouse.Listener(on_click=on_click)
@@ -184,31 +182,8 @@ def start_listener():
         mouse_listener.join()
         keyboard_listener.join()
 
-
-# 同步执行鼠标和键盘操作
-def sync_perform_action(action, x=None, y=None, hwnds=None, button='left', keys=None):
-    if hwnds is None:
-        windows = enumerate_chrome_windows()
-    else:
-        windows = hwnds
-
-    if not windows:
-        print("No Chrome windows found.")
-        return
-
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for hwnd in windows:
-            if action == 'click':
-                futures.append(executor.submit(send_mouse_click, hwnd, x, y, button))
-            elif action == 'keypress':
-                futures.append(executor.submit(send_key_press, hwnd, keys))
-
-        for future in futures:
-            future.result()
-
-
 if __name__ == "__main__":
+    hwnds = enumerate_chrome_windows()
+    for hwnd in hwnds:
+        set_window_size(hwnd)
     start_listener()
-
-
